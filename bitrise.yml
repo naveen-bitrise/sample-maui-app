@@ -1,0 +1,422 @@
+format_version: "17"
+default_step_lib_source: https://github.com/bitrise-io/bitrise-steplib.git
+project_type: other
+
+app:
+  envs:
+  # ---- Project layout -------------------------------------------------------
+  - APP_PROJECT: src/SampleMauiApp/SampleMauiApp.csproj
+  - UNIT_TEST_PROJECT: tests/SampleMauiApp.UnitTests/SampleMauiApp.UnitTests.csproj
+  - UI_TEST_PROJECT: tests/SampleMauiApp.UITests/SampleMauiApp.UITests.csproj
+  - APP_ID: io.bitrise.mauiapp
+
+  # ---- Toolchain ------------------------------------------------------------
+  # MAUI has no first-party Bitrise Step, so the SDK is installed with
+  # Microsoft's official dotnet-install.sh and cached between builds.
+  - DOTNET_CHANNEL: "10.0"
+  - IOS_TFM: net10.0-ios
+  - ANDROID_TFM: net10.0-android
+
+  # Keep the .NET CLI quiet and non-interactive on CI.
+  - DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  - DOTNET_NOLOGO: "1"
+  - DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+
+# Pipelines let the iOS and Android UI tests run at the same time on the
+# stacks each one actually needs (Android emulators cannot run on the
+# Apple Silicon macOS machines, so they must go to Linux).
+pipelines:
+  ui_tests:
+    workflows:
+      ui_tests_ios: {}
+      ui_tests_android: {}
+
+step_bundles:
+  # Installs the .NET SDK and puts it on PATH for every later Step.
+  install_dotnet:
+    steps:
+    - restore-cache@2:
+        title: Restore .NET SDK cache
+        inputs:
+        - key: dotnet-sdk-{{ .OS }}-{{ .Arch }}-$DOTNET_CHANNEL
+    - script@1:
+        title: Install .NET SDK
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euxo pipefail
+
+            export DOTNET_ROOT="$HOME/.dotnet"
+
+            if [ ! -x "$DOTNET_ROOT/dotnet" ]; then
+              curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+              chmod +x /tmp/dotnet-install.sh
+              /tmp/dotnet-install.sh --channel "$DOTNET_CHANNEL" --install-dir "$DOTNET_ROOT"
+            fi
+
+            envman add --key DOTNET_ROOT --value "$DOTNET_ROOT"
+            envman add --key PATH --value "$DOTNET_ROOT:$PATH"
+
+            "$DOTNET_ROOT/dotnet" --version
+
+  # NuGet packages change far less often than the SDK, so they get their own cache.
+  restore_nuget:
+    steps:
+    - restore-cache@2:
+        title: Restore NuGet cache
+        inputs:
+        - key: nuget-{{ .OS }}-{{ .Arch }}-{{ checksum "**/*.csproj" }}
+
+  save_caches:
+    steps:
+    - save-cache@1:
+        title: Save .NET SDK cache
+        is_always_run: true
+        inputs:
+        - key: dotnet-sdk-{{ .OS }}-{{ .Arch }}-$DOTNET_CHANNEL
+        - paths: $HOME/.dotnet
+    - save-cache@1:
+        title: Save NuGet cache
+        is_always_run: true
+        inputs:
+        - key: nuget-{{ .OS }}-{{ .Arch }}-{{ checksum "**/*.csproj" }}
+        - paths: $HOME/.nuget/packages
+
+  # Boots an Appium server in the background and waits for it to accept connections.
+  start_appium:
+    steps:
+    - script@1:
+        title: Install and start Appium
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euxo pipefail
+
+            npm install -g appium@3
+            appium driver install "$APPIUM_DRIVER" || true
+
+            appium server --port 4723 --log "$BITRISE_DEPLOY_DIR/appium.log" --log-level info &
+
+            for _ in $(seq 1 60); do
+              if curl -fsS http://127.0.0.1:4723/status > /dev/null; then
+                echo "Appium is up"
+                exit 0
+              fi
+              sleep 2
+            done
+
+            echo "Appium did not become ready in time" >&2
+            exit 1
+
+workflows:
+# ---------------------------------------------------------------------------
+# Unit tests - pure C#, no device or emulator needed, so this runs on Linux.
+# ---------------------------------------------------------------------------
+  unit_tests:
+    summary: Run the xUnit tests against the platform-independent core library.
+    meta:
+      bitrise.io:
+        stack: ubuntu-noble-24.04-bitrise-2025-android
+        machine_type_id: standard
+    steps:
+    - activate-ssh-key@4:
+        run_if: '{{getenv "SSH_RSA_PRIVATE_KEY" | ne ""}}'
+    - git-clone@8: {}
+    - bundle::install_dotnet: {}
+    - bundle::restore_nuget: {}
+    - script@1:
+        title: dotnet test (unit)
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euxo pipefail
+
+            dotnet test "$UNIT_TEST_PROJECT" \
+              --configuration Release \
+              --logger "junit;LogFilePath=$BITRISE_SOURCE_DIR/test-results/unit-tests.xml"
+    - script@1:
+        title: Collect test results
+        is_always_run: true
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euo pipefail
+
+            result_dir="$BITRISE_TEST_RESULT_DIR/unit-tests"
+            mkdir -p "$result_dir"
+            cp "$BITRISE_SOURCE_DIR/test-results/unit-tests.xml" "$result_dir/" 2>/dev/null || true
+            echo '{"test-name":"Unit tests"}' > "$result_dir/test-info.json"
+    - bundle::save_caches: {}
+    - deploy-to-bitrise-io@2:
+        is_always_run: true
+
+# ---------------------------------------------------------------------------
+# iOS: build an unsigned .app that runs on a simulator.
+# ---------------------------------------------------------------------------
+  build_simulator:
+    summary: Build the iOS app for the simulator and export the .app bundle.
+    meta:
+      bitrise.io:
+        stack: osx-xcode-26.6.x
+        machine_type_id: g2-m1.4core
+    steps:
+    - activate-ssh-key@4:
+        run_if: '{{getenv "SSH_RSA_PRIVATE_KEY" | ne ""}}'
+    - git-clone@8: {}
+    - bundle::install_dotnet: {}
+    - bundle::restore_nuget: {}
+    - script@1:
+        title: Build iOS simulator app
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euxo pipefail
+
+            dotnet workload install maui-ios --skip-sign-check
+
+            # iossimulator-arm64 matches Bitrise's Apple Silicon machines.
+            dotnet build "$APP_PROJECT" \
+              --framework "$IOS_TFM" \
+              --configuration Debug \
+              -p:RuntimeIdentifier=iossimulator-arm64
+
+            app_path="$(find "$BITRISE_SOURCE_DIR/src/SampleMauiApp/bin/Debug/$IOS_TFM/iossimulator-arm64" -maxdepth 1 -name '*.app' | head -1)"
+            test -n "$app_path"
+
+            # .app is a directory, so it has to be zipped to survive as an artifact.
+            ditto -c -k --sequesterRsrc --keepParent "$app_path" "$BITRISE_DEPLOY_DIR/SampleMauiApp-simulator.zip"
+
+            envman add --key BITRISE_APP_DIR_PATH --value "$app_path"
+    - bundle::save_caches: {}
+    - deploy-to-bitrise-io@2:
+        is_always_run: true
+
+# ---------------------------------------------------------------------------
+# Android: build a debug APK that runs on an emulator (and real devices).
+# ---------------------------------------------------------------------------
+  build_emulator:
+    summary: Build a debug APK that installs on an Android emulator.
+    meta:
+      bitrise.io:
+        stack: ubuntu-noble-24.04-bitrise-2025-android
+        machine_type_id: standard
+    steps:
+    - activate-ssh-key@4:
+        run_if: '{{getenv "SSH_RSA_PRIVATE_KEY" | ne ""}}'
+    - git-clone@8: {}
+    - bundle::install_dotnet: {}
+    - bundle::restore_nuget: {}
+    - script@1:
+        title: Build Android APK
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euxo pipefail
+
+            dotnet workload install maui-android --skip-sign-check
+
+            # The APK ships arm64-v8a + x86_64, so the same artifact runs on
+            # Linux (x86_64) and Apple Silicon emulators.
+            dotnet build "$APP_PROJECT" \
+              --framework "$ANDROID_TFM" \
+              --configuration Debug
+
+            apk="$(find "$BITRISE_SOURCE_DIR/src/SampleMauiApp/bin/Debug/$ANDROID_TFM" -maxdepth 1 -name '*-Signed.apk' | head -1)"
+            test -n "$apk"
+
+            cp "$apk" "$BITRISE_DEPLOY_DIR/"
+            envman add --key BITRISE_APK_PATH --value "$apk"
+    - bundle::save_caches: {}
+    - deploy-to-bitrise-io@2:
+        is_always_run: true
+
+# ---------------------------------------------------------------------------
+# UI tests - iOS simulator. Driven by Appium's XCUITest driver.
+# ---------------------------------------------------------------------------
+  ui_tests_ios:
+    summary: Run the Appium UI tests against an iOS simulator.
+    meta:
+      bitrise.io:
+        stack: osx-xcode-26.6.x
+        machine_type_id: g2-m1.4core
+    envs:
+    - APPIUM_DRIVER: xcuitest
+    steps:
+    - activate-ssh-key@4:
+        run_if: '{{getenv "SSH_RSA_PRIVATE_KEY" | ne ""}}'
+    - git-clone@8: {}
+    - bundle::install_dotnet: {}
+    - bundle::restore_nuget: {}
+    - script@1:
+        title: Build iOS simulator app
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euxo pipefail
+
+            dotnet workload install maui-ios --skip-sign-check
+
+            dotnet build "$APP_PROJECT" \
+              --framework "$IOS_TFM" \
+              --configuration Debug \
+              -p:RuntimeIdentifier=iossimulator-arm64
+
+            app_path="$(find "$BITRISE_SOURCE_DIR/src/SampleMauiApp/bin/Debug/$IOS_TFM/iossimulator-arm64" -maxdepth 1 -name '*.app' | head -1)"
+            test -n "$app_path"
+            envman add --key UITEST_APP_PATH --value "$app_path"
+    - script@1:
+        title: Boot an iOS simulator
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euo pipefail
+
+            # Pick whatever recent iPhone the stack actually ships rather than
+            # pinning a model name that may disappear on the next Xcode bump.
+            xcrun simctl list devices available --json > /tmp/simulators.json
+
+            python3 - <<'PYEOF' > /tmp/simulator.env
+            import json
+
+            with open("/tmp/simulators.json") as handle:
+                devices = json.load(handle)["devices"]
+
+            def ios_version(runtime):
+                """'...SimRuntime.iOS-26-5' -> (26, 5); non-iOS runtimes sort last."""
+                if "iOS-" not in runtime:
+                    return None
+                parts = runtime.rsplit("iOS-", 1)[-1].split("-")
+                return tuple(int(part) for part in parts if part.isdigit())
+
+            candidates = [r for r in devices if ios_version(r)]
+            if not candidates:
+                raise SystemExit("No iOS runtime found on this stack")
+
+            for runtime in sorted(candidates, key=ios_version, reverse=True):
+                for device in devices[runtime]:
+                    if device["name"].startswith("iPhone"):
+                        version = ".".join(str(n) for n in ios_version(runtime))
+                        # Quoted: simulator names contain spaces.
+                        print(f'UDID="{device["udid"]}"')
+                        print(f'NAME="{device["name"]}"')
+                        print(f'VERSION="{version}"')
+                        raise SystemExit(0)
+
+            raise SystemExit("No iPhone simulator found on this stack")
+            PYEOF
+
+            source /tmp/simulator.env
+
+            xcrun simctl boot "$UDID" || true
+            xcrun simctl bootstatus "$UDID" -b
+
+            envman add --key UITEST_PLATFORM --value ios
+            envman add --key UITEST_UDID --value "$UDID"
+            envman add --key UITEST_DEVICE_NAME --value "$NAME"
+            envman add --key UITEST_PLATFORM_VERSION --value "$VERSION"
+
+            echo "Booted $NAME ($VERSION) - $UDID"
+    - bundle::start_appium: {}
+    - script@1:
+        title: dotnet test (UI, iOS)
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euxo pipefail
+
+            dotnet test "$UI_TEST_PROJECT" \
+              --logger "junit;LogFilePath=$BITRISE_SOURCE_DIR/test-results/ui-tests-ios.xml"
+    - script@1:
+        title: Collect test results
+        is_always_run: true
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euo pipefail
+
+            result_dir="$BITRISE_TEST_RESULT_DIR/ui-tests-ios"
+            mkdir -p "$result_dir"
+            cp "$BITRISE_SOURCE_DIR/test-results/ui-tests-ios.xml" "$result_dir/" 2>/dev/null || true
+            echo '{"test-name":"UI tests (iOS)"}' > "$result_dir/test-info.json"
+    - bundle::save_caches: {}
+    - deploy-to-bitrise-io@2:
+        is_always_run: true
+
+# ---------------------------------------------------------------------------
+# UI tests - Android emulator. Must run on Linux: Android emulators cannot
+# run on Bitrise's Apple Silicon machines.
+# ---------------------------------------------------------------------------
+  ui_tests_android:
+    summary: Run the Appium UI tests against an Android emulator.
+    meta:
+      bitrise.io:
+        stack: ubuntu-noble-24.04-bitrise-2025-android
+        machine_type_id: elite-xl
+    envs:
+    - APPIUM_DRIVER: uiautomator2
+    steps:
+    - activate-ssh-key@4:
+        run_if: '{{getenv "SSH_RSA_PRIVATE_KEY" | ne ""}}'
+    - git-clone@8: {}
+    - avd-manager@2:
+        title: Start Android emulator
+        inputs:
+        - api_level: "35"
+        - profile: pixel_6
+        - tag: google_apis
+    - bundle::install_dotnet: {}
+    - bundle::restore_nuget: {}
+    - script@1:
+        title: Build Android APK
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euxo pipefail
+
+            dotnet workload install maui-android --skip-sign-check
+
+            dotnet build "$APP_PROJECT" \
+              --framework "$ANDROID_TFM" \
+              --configuration Debug
+
+            apk="$(find "$BITRISE_SOURCE_DIR/src/SampleMauiApp/bin/Debug/$ANDROID_TFM" -maxdepth 1 -name '*-Signed.apk' | head -1)"
+            test -n "$apk"
+
+            envman add --key UITEST_PLATFORM --value android
+            envman add --key UITEST_APP_PATH --value "$apk"
+            envman add --key UITEST_DEVICE_NAME --value "$BITRISE_EMULATOR_SERIAL"
+            envman add --key UITEST_UDID --value "$BITRISE_EMULATOR_SERIAL"
+    - wait-for-android-emulator@1:
+        inputs:
+        - boot_timeout: "600"
+    - bundle::start_appium: {}
+    - script@1:
+        title: dotnet test (UI, Android)
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euxo pipefail
+
+            dotnet test "$UI_TEST_PROJECT" \
+              --logger "junit;LogFilePath=$BITRISE_SOURCE_DIR/test-results/ui-tests-android.xml"
+    - script@1:
+        title: Collect test results
+        is_always_run: true
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euo pipefail
+
+            result_dir="$BITRISE_TEST_RESULT_DIR/ui-tests-android"
+            mkdir -p "$result_dir"
+            cp "$BITRISE_SOURCE_DIR/test-results/ui-tests-android.xml" "$result_dir/" 2>/dev/null || true
+            echo '{"test-name":"UI tests (Android)"}' > "$result_dir/test-info.json"
+    - bundle::save_caches: {}
+    - deploy-to-bitrise-io@2:
+        is_always_run: true
+
+trigger_map:
+- push_branch: main
+  workflow: unit_tests
+- pull_request_source_branch: "*"
+  workflow: unit_tests

@@ -1,0 +1,31 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+artifacts/
+test-results/
+
+# .NET / Visual Studio
+*.user
+*.userosscache
+*.suo
+*.sln.docstates
+.vs/
+.vscode/
+*.received.*
+
+# Rider
+.idea/
+
+# macOS
+.DS_Store
+
+# Android signing (never commit these)
+*.keystore
+*.jks
+
+# iOS signing
+*.mobileprovision
+*.p12
+*.cer
