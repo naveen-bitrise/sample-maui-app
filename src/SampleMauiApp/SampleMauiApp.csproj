@@ -1,7 +1,18 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
-		<TargetFrameworks>net10.0-android;net10.0-ios</TargetFrameworks>
+		<!--
+		  Pass -p:BuildPlatform=ios (or android) to build a single platform, which
+		  is what CI does. dotnet's implicit restore evaluates EVERY entry in
+		  TargetFrameworks, so a full set demands that every platform's workload be
+		  installed (error NETSDK1147) even when the build asks for just one
+		  framework. BuildPlatform is a custom property on purpose: overriding
+		  TargetFrameworks directly on the command line leaks into referenced
+		  projects and breaks SampleMauiApp.Core, which targets plain net10.0.
+		-->
+		<TargetFrameworks Condition="'$(BuildPlatform)' != ''">net10.0-$(BuildPlatform)</TargetFrameworks>
+		<TargetFrameworks Condition="'$(BuildPlatform)' == ''">net10.0-android</TargetFrameworks>
+		<TargetFrameworks Condition="'$(BuildPlatform)' == '' And !$([MSBuild]::IsOSPlatform('linux'))">net10.0-android;net10.0-ios</TargetFrameworks>
 
 		<!-- Note for MacCatalyst:
 		The default runtime is maccatalyst-x64, except in Release config, in which case the default is maccatalyst-x64;maccatalyst-arm64.

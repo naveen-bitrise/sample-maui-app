@@ -182,7 +182,11 @@ workflows:
             dotnet workload install maui-ios --skip-sign-check
 
             # iossimulator-arm64 matches Bitrise's Apple Silicon machines.
+            # BuildPlatform narrows the project to a single TargetFramework.
+            # Without it, dotnet's implicit restore evaluates every entry in
+            # TargetFrameworks and demands the android workload too (NETSDK1147).
             dotnet build "$APP_PROJECT" \
+              -p:BuildPlatform=ios \
               --framework "$IOS_TFM" \
               --configuration Debug \
               -p:RuntimeIdentifier=iossimulator-arm64
@@ -224,7 +228,12 @@ workflows:
 
             # The APK ships arm64-v8a + x86_64, so the same artifact runs on
             # Linux (x86_64) and Apple Silicon emulators.
+            # See the iOS note: restore evaluates every TargetFrameworks entry,
+            # so this must be narrowed or the build demands the ios workload.
+            # (On Linux the csproj already excludes iOS, but being explicit
+            # keeps this workflow runnable on a macOS stack too.)
             dotnet build "$APP_PROJECT" \
+              -p:BuildPlatform=android \
               --framework "$ANDROID_TFM" \
               --configuration Debug
 
@@ -263,7 +272,11 @@ workflows:
 
             dotnet workload install maui-ios --skip-sign-check
 
+            # BuildPlatform narrows the project to a single TargetFramework.
+            # Without it, dotnet's implicit restore evaluates every entry in
+            # TargetFrameworks and demands the android workload too (NETSDK1147).
             dotnet build "$APP_PROJECT" \
+              -p:BuildPlatform=ios \
               --framework "$IOS_TFM" \
               --configuration Debug \
               -p:RuntimeIdentifier=iossimulator-arm64
@@ -382,7 +395,12 @@ workflows:
 
             dotnet workload install maui-android --skip-sign-check
 
+            # See the iOS note: restore evaluates every TargetFrameworks entry,
+            # so this must be narrowed or the build demands the ios workload.
+            # (On Linux the csproj already excludes iOS, but being explicit
+            # keeps this workflow runnable on a macOS stack too.)
             dotnet build "$APP_PROJECT" \
+              -p:BuildPlatform=android \
               --framework "$ANDROID_TFM" \
               --configuration Debug
 

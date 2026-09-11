@@ -84,9 +84,9 @@ UITEST_PLATFORM=android UITEST_APP_PATH="$PWD/src/SampleMauiApp/bin/Debug/net10.
 `UITEST_APP_PATH` must be absolute — it is resolved against the test host's working
 directory, not the repo root.
 
-## Two MAUI gotchas worth knowing
+## Three MAUI gotchas worth knowing
 
-Both of these bit this repo during setup and are baked into the config now.
+All three bit this repo during setup and are baked into the config now.
 
 **1. Debug APKs are not self-contained by default.** MAUI's "Fast Deployment" ships
 Debug Android assemblies to the device separately instead of packaging them, so an
@@ -98,6 +98,22 @@ sets `EmbedAssembliesIntoApk=true` for Android so every APK we produce is instal
 On iOS it becomes the accessibility identifier; on Android it becomes the view's
 *resource-id* (`io.bitrise.mauiapp:id/CounterBtn`), not the content-description.
 `BaseTest.FindByAutomationId` hides that difference so the tests stay platform-agnostic.
+
+**3. Building one platform still requires every platform's workload.**
+`dotnet build --framework net10.0-ios` looks like it only needs the iOS workload,
+but the implicit restore evaluates *every* entry in `TargetFrameworks`, so it fails
+with `NETSDK1147: the following workloads must be installed: android`. Overriding
+`-p:TargetFrameworks` on the command line is the wrong fix: it is a global property
+and leaks into `SampleMauiApp.Core`, which targets plain `net10.0`. Instead the app
+csproj reads a custom `BuildPlatform` property, and CI passes `-p:BuildPlatform=ios`
+or `-p:BuildPlatform=android`:
+
+```bash
+dotnet build src/SampleMauiApp/SampleMauiApp.csproj -p:BuildPlatform=ios --framework net10.0-ios -c Debug -p:RuntimeIdentifier=iossimulator-arm64
+```
+
+With no `BuildPlatform` set you get both platforms on macOS and Android only on Linux,
+so a plain `dotnet build` still does the obvious thing locally.
 
 The Android launcher activity name is also pinned via
 `[Activity(Name = "io.bitrise.mauiapp.MainActivity")]` — without it, MAUI generates a
