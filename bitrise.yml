@@ -203,6 +203,137 @@ workflows:
         is_always_run: true
 
 # ---------------------------------------------------------------------------
+# iOS: build a signed, App Store-ready .ipa.
+#
+# Signing files come from the app's Code Signing tab on Bitrise. MAUI has no
+# .xcodeproj, so the newer manage-ios-code-signing Step (which reads one) is
+# not usable here - certificate-and-profile-installer just installs whatever
+# is uploaded, which is what a dotnet publish needs.
+# ---------------------------------------------------------------------------
+  build_appstore:
+    summary: Build a signed .ipa for App Store submission.
+    meta:
+      bitrise.io:
+        stack: osx-xcode-26.6.x
+        machine_type_id: g2-m1.4core
+    steps:
+    - activate-ssh-key@4:
+        run_if: '{{getenv "SSH_RSA_PRIVATE_KEY" | ne ""}}'
+    - git-clone@8: {}
+    - certificate-and-profile-installer@1: {}
+    - bundle::install_dotnet: {}
+    - bundle::restore_nuget: {}
+    - script@1:
+        title: Resolve code signing
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euo pipefail
+
+            # Discover the identity and profile instead of hardcoding names, and
+            # fail with a specific diagnosis when what is uploaded is the wrong
+            # kind - a development certificate or an ad-hoc profile will
+            # otherwise fail much later with an opaque codesign error.
+            python3 - <<'PYEOF' > /tmp/signing.env
+            import glob, os, plistlib, re, subprocess
+
+            bundle_id = os.environ["APP_ID"]
+
+            identities = re.findall(
+                r'"([^"]+)"',
+                subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"],
+                               capture_output=True, text=True).stdout,
+            )
+            distribution = [i for i in identities
+                            if i.startswith(("Apple Distribution", "iPhone Distribution"))]
+            if not distribution:
+                raise SystemExit(
+                    "No Apple/iPhone Distribution identity found in the keychain.\n"
+                    "Identities present: " + (", ".join(identities) or "none") + "\n"
+                    "An App Store build needs a distribution certificate, not a development one."
+                )
+
+            def read_profile(path):
+                xml = subprocess.run(["security", "cms", "-D", "-i", path],
+                                     capture_output=True).stdout
+                return plistlib.loads(xml)
+
+            exact, wildcard, rejected = [], [], []
+            pattern = os.path.expanduser(
+                "~/Library/MobileDevice/Provisioning Profiles/*.mobileprovision")
+            for path in glob.glob(pattern):
+                profile = read_profile(path)
+                app_id = profile.get("Entitlements", {}).get("application-identifier", "")
+                # An App Store profile provisions neither named devices (development
+                # and ad-hoc do) nor all devices (enterprise in-house does).
+                app_store = ("ProvisionedDevices" not in profile
+                             and not profile.get("ProvisionsAllDevices"))
+                label = f'{profile.get("Name")!r} [app-id={app_id}, app-store={app_store}]'
+                if not app_store:
+                    rejected.append(label)
+                elif app_id.endswith("." + bundle_id):
+                    exact.append((profile, label))
+                elif app_id.endswith(".*"):
+                    wildcard.append((profile, label))
+                else:
+                    rejected.append(label)
+
+            # Prefer a profile pinned to this bundle id over a wildcard one.
+            candidates = exact + wildcard
+            if not candidates:
+                raise SystemExit(
+                    f"No App Store provisioning profile matching {bundle_id}.\n"
+                    "Profiles installed: " + ("; ".join(rejected) or "none") + "\n"
+                    "Upload an App Store distribution profile for this bundle id."
+                )
+
+            profile, label = candidates[0]
+            print(f'CODESIGN_IDENTITY="{distribution[0]}"')
+            print(f'PROVISION_UUID="{profile["UUID"]}"')
+            print(f'PROVISION_LABEL={label!r}')
+            PYEOF
+
+            source /tmp/signing.env
+
+            envman add --key CODESIGN_IDENTITY --value "$CODESIGN_IDENTITY"
+            envman add --key PROVISION_UUID --value "$PROVISION_UUID"
+
+            echo "Identity: $CODESIGN_IDENTITY"
+            echo "Profile:  $PROVISION_LABEL"
+    - script@1:
+        title: Publish signed .ipa
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euxo pipefail
+
+            dotnet workload install maui-ios --skip-sign-check
+
+            # ArchiveOnBuild makes dotnet publish produce the .xcarchive and .ipa.
+            # ApplicationVersion is CFBundleVersion: App Store Connect rejects a
+            # rebuild that reuses a build number, so it tracks the Bitrise build.
+            dotnet publish "$APP_PROJECT" \
+              -p:BuildPlatform=ios \
+              --framework "$IOS_TFM" \
+              --configuration Release \
+              -p:RuntimeIdentifier=ios-arm64 \
+              -p:ArchiveOnBuild=true \
+              -p:CodesignKey="$CODESIGN_IDENTITY" \
+              -p:CodesignProvision="$PROVISION_UUID" \
+              -p:ApplicationVersion="$BITRISE_BUILD_NUMBER"
+
+            ipa="$(find "$BITRISE_SOURCE_DIR/src/SampleMauiApp/bin/Release/$IOS_TFM" -name '*.ipa' | head -1)"
+            test -n "$ipa"
+
+            cp "$ipa" "$BITRISE_DEPLOY_DIR/"
+            envman add --key BITRISE_IPA_PATH --value "$ipa"
+
+            echo "Built $(basename "$ipa")"
+    - bundle::save_caches: {}
+    - deploy-to-bitrise-io@2:
+        is_always_run: true
+
+# ---------------------------------------------------------------------------
 # Android: build a debug APK that runs on an emulator (and real devices).
 # ---------------------------------------------------------------------------
   build_emulator:

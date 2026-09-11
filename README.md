@@ -27,6 +27,7 @@ The point is the pipeline around it, not the app.
 | `unit_tests` | Ubuntu | `dotnet test` over the core library. No device needed, so it runs on Linux. |
 | `build_simulator` | macOS / Xcode | Builds the iOS `.app` for `iossimulator-arm64` and uploads it zipped. |
 | `build_emulator` | Ubuntu | Builds a debug APK (arm64-v8a + x86_64) that installs on an emulator. |
+| `build_appstore` | macOS / Xcode | Builds a **signed** `.ipa` for App Store submission. |
 | `ui_tests_ios` | macOS / Xcode | Boots a simulator, starts Appium, runs the UI tests. |
 | `ui_tests_android` | Ubuntu | Boots an emulator via AVD Manager, starts Appium, runs the UI tests. |
 
@@ -37,6 +38,36 @@ cannot run on Bitrise's Apple Silicon macOS machines — each half needs its own
 `.NET` has no first-party Bitrise Step, so the SDK is installed with Microsoft's
 official `dotnet-install.sh` in a Script Step and cached between builds, along with
 the NuGet package cache.
+
+## App Store builds
+
+`build_appstore` signs with the `.p12` certificate and provisioning profile uploaded
+to the app's **Code Signing** tab on Bitrise. MAUI has no `.xcodeproj`, so the newer
+`manage-ios-code-signing` Step (which reads one to decide what to install) does not
+apply — `certificate-and-profile-installer` simply installs what is uploaded, which
+is all `dotnet publish` needs.
+
+Rather than hardcoding a certificate name or profile UUID, the workflow discovers them:
+
+- it picks an `Apple Distribution` / `iPhone Distribution` identity, never a development one
+- it picks a profile that provisions **neither** named devices (development and ad-hoc do)
+  **nor** all devices (enterprise in-house does) — that combination is what identifies an
+  App Store profile — and prefers one pinned to `io.bitrise.mauiapp` over a wildcard
+- if neither is found it fails immediately, listing every identity and profile it saw
+
+That last point matters: an ad-hoc profile or a development certificate otherwise gets
+you an opaque `codesign` failure deep into the publish.
+
+`ApplicationVersion` (`CFBundleVersion`) is set from `$BITRISE_BUILD_NUMBER`, since App
+Store Connect rejects an upload that reuses a build number. The marketing version
+(`ApplicationDisplayVersion`) stays in the csproj.
+
+If the `.p12` has a passphrase, store it with the certificate on the Code Signing tab —
+the installer Step picks it up from there.
+
+The workflow produces the `.ipa` as a build artifact; actually uploading it to App Store
+Connect / TestFlight is a separate Step that needs an App Store Connect API key
+configured on the workspace.
 
 ## Running locally
 
