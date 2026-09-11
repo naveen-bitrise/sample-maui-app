@@ -28,6 +28,7 @@ The point is the pipeline around it, not the app.
 | `build_simulator` | macOS / Xcode | Builds the iOS `.app` for `iossimulator-arm64` and uploads it zipped. |
 | `build_emulator` | Ubuntu | Builds a debug APK (arm64-v8a + x86_64) that installs on an emulator. |
 | `build_appstore` | macOS / Xcode | Builds a **signed** `.ipa` for App Store submission. |
+| `build_adhoc` | macOS / Xcode | Builds a **signed** `.ipa` for ad-hoc install on registered devices. |
 | `ui_tests_ios` | macOS / Xcode | Boots a simulator, starts Appium, runs the UI tests. |
 | `ui_tests_android` | Ubuntu | Boots an emulator via AVD Manager, starts Appium, runs the UI tests. |
 
@@ -39,24 +40,39 @@ cannot run on Bitrise's Apple Silicon macOS machines — each half needs its own
 official `dotnet-install.sh` in a Script Step and cached between builds, along with
 the NuGet package cache.
 
-## App Store builds
+## Signed iOS builds
 
-`build_appstore` signs with the `.p12` certificate and provisioning profile uploaded
-to the app's **Code Signing** tab on Bitrise. MAUI has no `.xcodeproj`, so the newer
-`manage-ios-code-signing` Step (which reads one to decide what to install) does not
-apply — `certificate-and-profile-installer` simply installs what is uploaded, which
-is all `dotnet publish` needs.
+`build_appstore` and `build_adhoc` both sign with the `.p12` certificate and
+provisioning profile uploaded to the app's **Code Signing** tab on Bitrise. They share
+one `sign_and_publish_ipa` step bundle and differ only in a `DISTRIBUTION_TYPE` env var,
+which decides which kind of profile is required.
 
-Rather than hardcoding a certificate name or profile UUID, the workflow discovers them:
+MAUI has no `.xcodeproj`, so the newer `manage-ios-code-signing` Step (which reads one to
+decide what to install) does not apply — `certificate-and-profile-installer` simply
+installs what is uploaded, which is all `dotnet publish` needs.
 
-- it picks an `Apple Distribution` / `iPhone Distribution` identity, never a development one
-- it picks a profile that provisions **neither** named devices (development and ad-hoc do)
-  **nor** all devices (enterprise in-house does) — that combination is what identifies an
-  App Store profile — and prefers one pinned to `io.bitrise.mauiapp` over a wildcard
-- if neither is found it fails immediately, listing every identity and profile it saw
+Rather than hardcoding a certificate name or profile UUID, the bundle discovers them:
 
-That last point matters: an ad-hoc profile or a development certificate otherwise gets
-you an opaque `codesign` failure deep into the publish.
+- it picks an `Apple Distribution` / `iPhone Distribution` identity — both channels sign
+  with a distribution certificate; only development builds use a development one
+- it classifies every installed profile and keeps those matching `DISTRIBUTION_TYPE`,
+  preferring a profile pinned to `io.bitrise.mauiapp` over a wildcard:
+
+  | Profile contents | Channel |
+  |---|---|
+  | `ProvisionsAllDevices` | enterprise |
+  | `ProvisionedDevices` + `get-task-allow` | development |
+  | `ProvisionedDevices`, no `get-task-allow` | ad-hoc |
+  | neither | app-store |
+
+- for an ad-hoc build it additionally fails when the profile has **no** registered
+  devices, since the `.ipa` could not install anywhere
+- if nothing matches it fails immediately, listing every identity and profile it saw
+  along with the type it detected
+
+That last point matters: the wrong profile type otherwise costs you an opaque `codesign`
+failure minutes into the publish. Pointing `build_appstore` at an ad-hoc profile instead
+fails in under a second, naming the reason.
 
 `ApplicationVersion` (`CFBundleVersion`) is set from `$BITRISE_BUILD_NUMBER`, since App
 Store Connect rejects an upload that reuses a build number. The marketing version
@@ -65,9 +81,14 @@ Store Connect rejects an upload that reuses a build number. The marketing versio
 If the `.p12` has a passphrase, store it with the certificate on the Code Signing tab —
 the installer Step picks it up from there.
 
-The workflow produces the `.ipa` as a build artifact; actually uploading it to App Store
-Connect / TestFlight is a separate Step that needs an App Store Connect API key
-configured on the workspace.
+Both workflows produce the `.ipa` as a build artifact, and `deploy-to-bitrise-io`
+publishes a public install page for it — which is how an ad-hoc tester on the profile's
+device list installs the build. Uploading to App Store Connect / TestFlight is a separate
+Step needing an App Store Connect API key configured on the workspace.
+
+An ad-hoc `.ipa` installs **only** on UDIDs baked into the profile, so adding a tester
+means registering the device, regenerating the profile, re-uploading it and rebuilding.
+TestFlight avoids that, but needs an App Store profile and therefore `build_appstore`.
 
 ## Running locally
 
