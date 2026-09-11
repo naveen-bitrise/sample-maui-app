@@ -2,6 +2,13 @@ format_version: "17"
 default_step_lib_source: https://github.com/bitrise-io/bitrise-steplib.git
 project_type: other
 
+# Default stack for anything that does not override it. Each workflow below
+# pins the stack it actually needs.
+meta:
+  bitrise.io:
+    stack: ubuntu-noble-24.04-bitrise-2025-android
+    machine_type_id: standard
+
 app:
   envs:
   # ---- Project layout -------------------------------------------------------
