@@ -89,6 +89,145 @@ step_bundles:
         - key: nuget-{{ .OS }}-{{ .Arch }}-{{ checksum "**/*.csproj" }}
         - paths: $HOME/.nuget/packages
 
+  # Resolves code signing and publishes a signed .ipa. The calling workflow sets
+  # DISTRIBUTION_TYPE to app-store or ad-hoc; everything else is identical, so
+  # the two iOS release workflows share this.
+  sign_and_publish_ipa:
+    steps:
+    - script@1:
+        title: Resolve code signing
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euo pipefail
+
+            # Discover the identity and profile instead of hardcoding names, and
+            # fail with a specific diagnosis when what is uploaded is the wrong
+            # kind. Otherwise a mismatched profile surfaces much later as an
+            # opaque codesign error, after minutes of build time.
+            python3 - <<'PYEOF' > /tmp/signing.env
+            import glob, os, plistlib, re, subprocess
+
+            bundle_id = os.environ["APP_ID"]
+            wanted = os.environ["DISTRIBUTION_TYPE"]
+
+            identities = re.findall(
+                r'"([^"]+)"',
+                subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"],
+                               capture_output=True, text=True).stdout,
+            )
+            # Both app-store and ad-hoc distribution sign with a distribution
+            # certificate; only development builds use a development one.
+            distribution = [i for i in identities
+                            if i.startswith(("Apple Distribution", "iPhone Distribution"))]
+            if not distribution:
+                raise SystemExit(
+                    "No Apple/iPhone Distribution identity found in the keychain.\n"
+                    "Identities present: " + (", ".join(identities) or "none") + "\n"
+                    f"A {wanted!r} build needs a distribution certificate, not a development one."
+                )
+
+            def classify(profile):
+                """Which distribution channel a .mobileprovision is for."""
+                if profile.get("ProvisionsAllDevices"):
+                    return "enterprise"
+                if "ProvisionedDevices" in profile:
+                    # Development profiles allow debugging; ad-hoc ones do not.
+                    if profile.get("Entitlements", {}).get("get-task-allow"):
+                        return "development"
+                    return "ad-hoc"
+                return "app-store"
+
+            def read_profile(path):
+                xml = subprocess.run(["security", "cms", "-D", "-i", path],
+                                     capture_output=True).stdout
+                return plistlib.loads(xml)
+
+            exact, wildcard, rejected = [], [], []
+            pattern = os.path.expanduser(
+                "~/Library/MobileDevice/Provisioning Profiles/*.mobileprovision")
+            for path in glob.glob(pattern):
+                profile = read_profile(path)
+                app_id = profile.get("Entitlements", {}).get("application-identifier", "")
+                kind = classify(profile)
+                label = f'{profile.get("Name")!r} [type={kind}, app-id={app_id}]'
+                if kind != wanted:
+                    rejected.append(label)
+                elif app_id.endswith("." + bundle_id):
+                    exact.append((profile, label))
+                elif app_id.endswith(".*"):
+                    wildcard.append((profile, label))
+                else:
+                    rejected.append(label)
+
+            # Prefer a profile pinned to this bundle id over a wildcard one.
+            candidates = exact + wildcard
+            if not candidates:
+                raise SystemExit(
+                    f"No {wanted} provisioning profile matching {bundle_id}.\n"
+                    "Profiles installed: " + ("; ".join(rejected) or "none") + "\n"
+                    f"Upload a profile of type {wanted!r} for this bundle id, or run "
+                    "the workflow that matches the profile you have."
+                )
+
+            profile, label = candidates[0]
+            devices = profile.get("ProvisionedDevices") or []
+            print(f'CODESIGN_IDENTITY="{distribution[0]}"')
+            print(f'PROVISION_UUID="{profile["UUID"]}"')
+            print(f'PROVISION_LABEL={label!r}')
+            print(f'PROVISION_DEVICE_COUNT="{len(devices)}"')
+            PYEOF
+
+            source /tmp/signing.env
+
+            envman add --key CODESIGN_IDENTITY --value "$CODESIGN_IDENTITY"
+            envman add --key PROVISION_UUID --value "$PROVISION_UUID"
+
+            echo "Distribution: $DISTRIBUTION_TYPE"
+            echo "Identity:     $CODESIGN_IDENTITY"
+            echo "Profile:      $PROVISION_LABEL"
+
+            if [ "$DISTRIBUTION_TYPE" = "ad-hoc" ]; then
+              # An ad-hoc build only installs on devices listed in the profile,
+              # so an empty list means the .ipa is useless before anyone tries it.
+              echo "Devices:      $PROVISION_DEVICE_COUNT registered"
+              if [ "$PROVISION_DEVICE_COUNT" = "0" ]; then
+                echo "This ad-hoc profile has no registered devices - the .ipa will not install anywhere." >&2
+                exit 1
+              fi
+            fi
+    - script@1:
+        title: Publish signed .ipa
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euxo pipefail
+
+            dotnet workload install maui-ios --skip-sign-check
+
+            # ArchiveOnBuild makes dotnet publish produce the .xcarchive and .ipa.
+            # The provisioning profile decides the distribution channel, so the
+            # same command serves app-store and ad-hoc.
+            # ApplicationVersion is CFBundleVersion: App Store Connect rejects a
+            # rebuild that reuses a build number, so it tracks the Bitrise build.
+            dotnet publish "$APP_PROJECT" \
+              -p:BuildPlatform=ios \
+              --framework "$IOS_TFM" \
+              --configuration Release \
+              -p:RuntimeIdentifier=ios-arm64 \
+              -p:ArchiveOnBuild=true \
+              -p:CodesignKey="$CODESIGN_IDENTITY" \
+              -p:CodesignProvision="$PROVISION_UUID" \
+              -p:ApplicationVersion="$BITRISE_BUILD_NUMBER"
+
+            ipa="$(find "$BITRISE_SOURCE_DIR/src/SampleMauiApp/bin/Release/$IOS_TFM" -name '*.ipa' | head -1)"
+            test -n "$ipa"
+
+            cp "$ipa" "$BITRISE_DEPLOY_DIR/"
+            envman add --key BITRISE_IPA_PATH --value "$ipa"
+
+            echo "Built $(basename "$ipa") ($DISTRIBUTION_TYPE)"
+
   # Boots an Appium server in the background and waits for it to accept connections.
   start_appium:
     steps:
@@ -203,12 +342,11 @@ workflows:
         is_always_run: true
 
 # ---------------------------------------------------------------------------
-# iOS: build a signed, App Store-ready .ipa.
-#
-# Signing files come from the app's Code Signing tab on Bitrise. MAUI has no
-# .xcodeproj, so the newer manage-ios-code-signing Step (which reads one) is
-# not usable here - certificate-and-profile-installer just installs whatever
-# is uploaded, which is what a dotnet publish needs.
+# iOS release builds. Both sign with the certificate and provisioning profile
+# uploaded to the app's Code Signing tab, and differ only in which profile
+# they require. MAUI has no .xcodeproj, so the newer manage-ios-code-signing
+# Step (which reads one) is not usable here - certificate-and-profile-installer
+# just installs what is uploaded, which is all dotnet publish needs.
 # ---------------------------------------------------------------------------
   build_appstore:
     summary: Build a signed .ipa for App Store submission.
@@ -216,6 +354,8 @@ workflows:
       bitrise.io:
         stack: osx-xcode-26.6.x
         machine_type_id: g2-m1.4core
+    envs:
+    - DISTRIBUTION_TYPE: app-store
     steps:
     - activate-ssh-key@4:
         run_if: '{{getenv "SSH_RSA_PRIVATE_KEY" | ne ""}}'
@@ -223,113 +363,30 @@ workflows:
     - certificate-and-profile-installer@1: {}
     - bundle::install_dotnet: {}
     - bundle::restore_nuget: {}
-    - script@1:
-        title: Resolve code signing
-        inputs:
-        - content: |-
-            #!/usr/bin/env bash
-            set -euo pipefail
-
-            # Discover the identity and profile instead of hardcoding names, and
-            # fail with a specific diagnosis when what is uploaded is the wrong
-            # kind - a development certificate or an ad-hoc profile will
-            # otherwise fail much later with an opaque codesign error.
-            python3 - <<'PYEOF' > /tmp/signing.env
-            import glob, os, plistlib, re, subprocess
-
-            bundle_id = os.environ["APP_ID"]
-
-            identities = re.findall(
-                r'"([^"]+)"',
-                subprocess.run(["security", "find-identity", "-v", "-p", "codesigning"],
-                               capture_output=True, text=True).stdout,
-            )
-            distribution = [i for i in identities
-                            if i.startswith(("Apple Distribution", "iPhone Distribution"))]
-            if not distribution:
-                raise SystemExit(
-                    "No Apple/iPhone Distribution identity found in the keychain.\n"
-                    "Identities present: " + (", ".join(identities) or "none") + "\n"
-                    "An App Store build needs a distribution certificate, not a development one."
-                )
-
-            def read_profile(path):
-                xml = subprocess.run(["security", "cms", "-D", "-i", path],
-                                     capture_output=True).stdout
-                return plistlib.loads(xml)
-
-            exact, wildcard, rejected = [], [], []
-            pattern = os.path.expanduser(
-                "~/Library/MobileDevice/Provisioning Profiles/*.mobileprovision")
-            for path in glob.glob(pattern):
-                profile = read_profile(path)
-                app_id = profile.get("Entitlements", {}).get("application-identifier", "")
-                # An App Store profile provisions neither named devices (development
-                # and ad-hoc do) nor all devices (enterprise in-house does).
-                app_store = ("ProvisionedDevices" not in profile
-                             and not profile.get("ProvisionsAllDevices"))
-                label = f'{profile.get("Name")!r} [app-id={app_id}, app-store={app_store}]'
-                if not app_store:
-                    rejected.append(label)
-                elif app_id.endswith("." + bundle_id):
-                    exact.append((profile, label))
-                elif app_id.endswith(".*"):
-                    wildcard.append((profile, label))
-                else:
-                    rejected.append(label)
-
-            # Prefer a profile pinned to this bundle id over a wildcard one.
-            candidates = exact + wildcard
-            if not candidates:
-                raise SystemExit(
-                    f"No App Store provisioning profile matching {bundle_id}.\n"
-                    "Profiles installed: " + ("; ".join(rejected) or "none") + "\n"
-                    "Upload an App Store distribution profile for this bundle id."
-                )
-
-            profile, label = candidates[0]
-            print(f'CODESIGN_IDENTITY="{distribution[0]}"')
-            print(f'PROVISION_UUID="{profile["UUID"]}"')
-            print(f'PROVISION_LABEL={label!r}')
-            PYEOF
-
-            source /tmp/signing.env
-
-            envman add --key CODESIGN_IDENTITY --value "$CODESIGN_IDENTITY"
-            envman add --key PROVISION_UUID --value "$PROVISION_UUID"
-
-            echo "Identity: $CODESIGN_IDENTITY"
-            echo "Profile:  $PROVISION_LABEL"
-    - script@1:
-        title: Publish signed .ipa
-        inputs:
-        - content: |-
-            #!/usr/bin/env bash
-            set -euxo pipefail
-
-            dotnet workload install maui-ios --skip-sign-check
-
-            # ArchiveOnBuild makes dotnet publish produce the .xcarchive and .ipa.
-            # ApplicationVersion is CFBundleVersion: App Store Connect rejects a
-            # rebuild that reuses a build number, so it tracks the Bitrise build.
-            dotnet publish "$APP_PROJECT" \
-              -p:BuildPlatform=ios \
-              --framework "$IOS_TFM" \
-              --configuration Release \
-              -p:RuntimeIdentifier=ios-arm64 \
-              -p:ArchiveOnBuild=true \
-              -p:CodesignKey="$CODESIGN_IDENTITY" \
-              -p:CodesignProvision="$PROVISION_UUID" \
-              -p:ApplicationVersion="$BITRISE_BUILD_NUMBER"
-
-            ipa="$(find "$BITRISE_SOURCE_DIR/src/SampleMauiApp/bin/Release/$IOS_TFM" -name '*.ipa' | head -1)"
-            test -n "$ipa"
-
-            cp "$ipa" "$BITRISE_DEPLOY_DIR/"
-            envman add --key BITRISE_IPA_PATH --value "$ipa"
-
-            echo "Built $(basename "$ipa")"
+    - bundle::sign_and_publish_ipa: {}
     - bundle::save_caches: {}
+    - deploy-to-bitrise-io@2:
+        is_always_run: true
+
+  build_adhoc:
+    summary: Build a signed .ipa for ad-hoc distribution to registered devices.
+    meta:
+      bitrise.io:
+        stack: osx-xcode-26.6.x
+        machine_type_id: g2-m1.4core
+    envs:
+    - DISTRIBUTION_TYPE: ad-hoc
+    steps:
+    - activate-ssh-key@4:
+        run_if: '{{getenv "SSH_RSA_PRIVATE_KEY" | ne ""}}'
+    - git-clone@8: {}
+    - certificate-and-profile-installer@1: {}
+    - bundle::install_dotnet: {}
+    - bundle::restore_nuget: {}
+    - bundle::sign_and_publish_ipa: {}
+    - bundle::save_caches: {}
+    # deploy-to-bitrise-io publishes a public install page for the .ipa by
+    # default, which is how testers on the profile's device list install it.
     - deploy-to-bitrise-io@2:
         is_always_run: true
 
